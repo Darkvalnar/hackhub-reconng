@@ -7,6 +7,7 @@ import {
 } from "@hotbunny/hackhub-content-sdk";
 import { BreachBackend, type BreachModule, type BreachSession, type BreachPrivilege, type BreachResolvedTarget, type DesktopProfile } from "../world/BreachBackend";
 import { ReconNgEvents } from "../world/ReconNgEvents";
+import { localPrivilegeProfile } from "../world/LocalPrivilegeTargets";
 import {
     resolveServiceBinary,
     getServiceBinaryOverride,
@@ -1144,27 +1145,32 @@ async function runSessionCommand(tools: CommandTools, state: ConsoleState, line:
         }
         return false;
     }
-    if (command === "linpeas") {
+    if (command === "linpeas" || command === "winpeas") {
+        const expected = localPrivilegeProfile(session.ip, session.host)?.os === "windows" ? "winpeas" : "linpeas";
+        if (command !== expected) {
+            tools.printError(`use ${expected} on this host`);
+            return false;
+        }
         const [action, routineId, value] = args;
         if (!action) {
             ReconNgEvents.emit("ReconNg.Breach.LocalActivity", { sessionId: session.id, ip: session.ip, host: session.host, action: "scan" });
             const result = BreachBackend.scanLocalPrivilege(session.id);
-            if (!result.ok) tools.printError(`linpeas: ${result.reason}`);
+            if (!result.ok) tools.printError(`${command}: ${result.reason}`);
             else for (const observation of result.observations) tools.println(observation);
         } else if (action === "inspect" && routineId && !value) {
             ReconNgEvents.emit("ReconNg.Breach.LocalActivity", { sessionId: session.id, ip: session.ip, host: session.host, action: "inspect" });
             const result = BreachBackend.inspectLocalPrivilege(session.id, routineId);
-            if (!result.ok) tools.printError(`linpeas: ${result.reason}`);
+            if (!result.ok) tools.printError(`${command}: ${result.reason}`);
             else for (const line of result.lines) tools.println(line);
         } else if (action === "probe" && routineId && value) {
             ReconNgEvents.emit("ReconNg.Breach.LocalActivity", { sessionId: session.id, ip: session.ip, host: session.host, action: "probe" });
             const result = BreachBackend.probeLocalPrivilege(session.id, routineId, value);
-            if (!result.ok) tools.printError(`linpeas: ${result.reason}`);
+            if (!result.ok) tools.printError(`${command}: ${result.reason}`);
             else tools.println(`probe: ${result.observation}`);
         } else {
-            tools.println("linpeas");
-            tools.println("linpeas inspect <routine>");
-            tools.println("linpeas probe <routine> <input>");
+            tools.println(command);
+            tools.println(`${command} inspect <routine>`);
+            tools.println(`${command} probe <routine> <input>`);
         }
         return false;
     }
@@ -1179,7 +1185,7 @@ async function runSessionCommand(tools: CommandTools, state: ConsoleState, line:
             ReconNgEvents.emit("ReconNg.Breach.LocalActivity", { sessionId: session.id, ip: session.ip, host: session.host, action: "run" });
             const result = BreachBackend.runLocalPrivilege(session.id);
             if (!result.ok) tools.printError(`privesc: ${result.reason}`);
-            else tools.printSuccess("local escalation succeeded; session is root");
+            else tools.printSuccess(`local escalation succeeded; session is ${BreachBackend.getSession(session.id)?.user ?? "root"}`);
         } else {
             tools.println("privesc build <routine> <input>");
             tools.println("privesc run");
@@ -1404,6 +1410,7 @@ function printSessionHelp(tools: CommandTools, access?: string): void {
     printHelpEntry(tools, "sudo <password>", "switch to root with a cracked password", 18);
     printHelpEntry(tools, "cat <file>", "read file", 18);
     printHelpEntry(tools, "linpeas", "find and inspect privileged local routines", 18);
+    printHelpEntry(tools, "winpeas", "find and inspect privileged Windows routines", 18);
     printHelpEntry(tools, "privesc", "prepare and run a local escalation", 18);
     printHelpEntry(tools, "download <file>", "save file to ~/downloads", 18);
     printHelpEntry(tools, "rm <file>", "remove file when permitted", 18);

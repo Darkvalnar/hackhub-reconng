@@ -1822,6 +1822,9 @@ export const BreachBackend = {
         session.user = targetUser;
         session.privilege = targetUser === "root" ? "root" : "user";
         setState(state);
+        if (session.privilege === "root") ReconNgEvents.emit("ReconNg.Breach.PrivilegeEscalated", {
+            sessionId: session.id, ip: session.ip, host: session.host, technique: "credential",
+        });
         return { ok: true, session };
     },
 
@@ -1843,7 +1846,7 @@ export const BreachBackend = {
         if (!routine) return { ok: false, reason: "routine not found" };
         return { ok: true, lines: [
             `process: ${routine.process}`,
-            "effective user: root",
+            `effective user: ${profile.os === "windows" ? "SYSTEM" : "root"}`,
             `input: ${routine.input}`,
             `action: ${routine.action}`,
             `guard: ${routine.guard}`,
@@ -1864,7 +1867,7 @@ export const BreachBackend = {
         }
         const fits = value === profile.solution.value;
         return { ok: true, observation: profile.family === "search-path"
-            ? fits ? `${value} reaches the root command lookup` : `${value} is not invoked by this routine`
+            ? fits ? `${value} reaches the privileged command lookup` : `${value} is not invoked by this routine`
             : fits ? "label reaches the saved return slot" : "label does not reach the saved return slot" };
     },
 
@@ -1893,7 +1896,7 @@ export const BreachBackend = {
             this.updateSession(session);
             return { ok: false, reason: "local escalation failed; session remains unprivileged" };
         }
-        session.user = "root";
+        session.user = profile.os === "windows" ? "SYSTEM" : "root";
         session.privilege = "root";
         this.updateSession(session);
         ReconNgEvents.emit("ReconNg.Breach.PrivilegeEscalated", {

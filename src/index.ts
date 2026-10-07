@@ -122,7 +122,7 @@ while \`sessions clear\` closes all of them.
 
 Inside a normal shell session, use \`ls\`, \`cd\`, \`pwd\`, \`whoami\`,
 \`su [user]\`, \`sudo <password>\`, \`cat <file>\`, \`download <file>\`,
-\`rm <file>\`, \`post [module]\`, \`linpeas\`, \`privesc\`, \`background\`,
+\`rm <file>\`, \`post [module]\`, \`linpeas\`, \`winpeas\`, \`privesc\`, \`background\`,
 and \`close\`.
 
 Downloaded files are saved to \`~/downloads\`.
@@ -281,7 +281,7 @@ const LOCAL_PRIVILEGE_CONTENT = `
 # Local Privilege Escalation
 
 Some exploited targets may allow local privilege escalation by abusing a buffer overflow or command lookup in certain functions.
-To get a list of local functions that run as root, use the linpeas command and then inspect each function with linpeas inspect:
+On Linux targets, to get a list of local functions that run as root, use the linpeas command and then inspect each function with linpeas inspect:
 
 \`\`\`
 linpeas
@@ -340,6 +340,8 @@ local input prepared for archive-sync-check
 
 > privesc run
 \`\`\`
+
+On Windows hosts, use \`winpeas\` and \`winpeas inspect <function>\` instead. The inspected routines run as SYSTEM. Use the same \`privesc build <function> <input>\` and \`privesc run\` commands after identifying an unguarded function.
 `.trim();
 
 

@@ -3,6 +3,7 @@ export type LocalPrivilegeFamily = "search-path" | "fixed-buffer";
 export interface LocalPrivilegeTarget {
     target: string;
     seed?: string;
+    os?: "linux" | "windows";
     families?: LocalPrivilegeFamily[];
 }
 
@@ -15,6 +16,7 @@ export interface LocalPrivilegeRoutine {
 }
 
 export interface LocalPrivilegeProfile {
+    os: "linux" | "windows";
     family: LocalPrivilegeFamily;
     routines: LocalPrivilegeRoutine[];
     solution: { routineId: string; value: string };
@@ -30,9 +32,53 @@ function hash(value: string): number {
 }
 
 export function buildLocalPrivilegeProfile(target: LocalPrivilegeTarget, ip: string, _host: string): LocalPrivilegeProfile {
+    const os = target.os === "windows" ? "windows" : "linux";
     const families = target.families?.length ? target.families : ["search-path", "fixed-buffer"] as LocalPrivilegeFamily[];
     const chosen = hash(`${target.seed ?? ip}|local-privilege-v2`);
     const family = families[chosen % families.length];
+    if (os === "windows") {
+        if (family === "search-path") {
+            const jobs = [
+                { id: "vault-backup", command: "robocopy.exe", work: "a backup job" },
+                { id: "ledger-export", command: "powershell.exe", work: "an export job" },
+                { id: "snapshot-check", command: "certutil.exe", work: "an integrity check" },
+                { id: "mirror-sync", command: "xcopy.exe", work: "a mirror job" },
+            ] as const;
+            const index = (chosen >>> 12) % jobs.length;
+            const vulnerable = jobs[index];
+            const guarded = jobs[(index + 1) % jobs.length];
+            const routine = (job: typeof vulnerable, unsafe: boolean): LocalPrivilegeRoutine => ({
+                id: job.id,
+                process: `C:\\Program Files\\VaultOps\\${job.id}.exe`,
+                input: unsafe ? "session environment" : "administrator configuration",
+                action: `invokes ${job.command} by name for ${job.work}`,
+                guard: unsafe ? "no fixed system path before command lookup" : "system command path pinned before environment entries",
+            });
+            return {
+                os, family,
+                routines: chosen & 2 ? [routine(guarded, false), routine(vulnerable, true)] : [routine(vulnerable, true), routine(guarded, false)],
+                solution: { routineId: vulnerable.id, value: vulnerable.command },
+            };
+        }
+        const jobs = ["vault-index-check", "archive-verify", "queue-decode", "record-parse"];
+        const index = (chosen >>> 12) % jobs.length;
+        const buffer = [32, 48, 64, 80][(chosen >>> 5) % 4];
+        const frame = [8, 16][(chosen >>> 9) % 2];
+        const routine = (id: string, unsafe: boolean): LocalPrivilegeRoutine => ({
+            id,
+            process: `C:\\Program Files\\VaultOps\\${id}.exe`,
+            input: "label argument",
+            action: `copies label into a ${buffer}-byte buffer; saved frame is ${frame} bytes`,
+            guard: unsafe ? "length checked after copy" : "length checked before copy",
+        });
+        const vulnerable = jobs[index];
+        const guarded = jobs[(index + 1) % jobs.length];
+        return {
+            os, family,
+            routines: chosen & 2 ? [routine(guarded, false), routine(vulnerable, true)] : [routine(vulnerable, true), routine(guarded, false)],
+            solution: { routineId: vulnerable, value: String(buffer + frame) },
+        };
+    }
     if (family === "search-path") {
         const jobs = [
             { id: "archive-sync", command: "tar", work: "an archive job" },
@@ -62,6 +108,7 @@ export function buildLocalPrivilegeProfile(target: LocalPrivilegeTarget, ip: str
             guard: "system command path pinned before environment entries",
         };
         return {
+            os,
             family,
             routines: chosen & 2 ? [guarded, vulnerable] : [vulnerable, guarded],
             solution: { routineId: vulnerable.id, value: job.command },
@@ -89,6 +136,7 @@ export function buildLocalPrivilegeProfile(target: LocalPrivilegeTarget, ip: str
         guard: "length checked before copy",
     };
     return {
+        os,
         family,
         routines: chosen & 2 ? [guarded, vulnerable] : [vulnerable, guarded],
         solution: { routineId: vulnerable.id, value: String(buffer + frame) },

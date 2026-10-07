@@ -8,6 +8,7 @@ function isTarget(value: unknown): value is LocalPrivilegeTarget {
     const target = value as Record<string, unknown>;
     return typeof target.target === "string"
         && (target.seed === undefined || typeof target.seed === "string")
+        && (target.os === undefined || target.os === "linux" || target.os === "windows")
         && (target.families === undefined || (Array.isArray(target.families)
             && target.families.every((family) => family === "search-path" || family === "fixed-buffer")));
 }
