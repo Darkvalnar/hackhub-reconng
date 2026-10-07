@@ -16,6 +16,8 @@ import { syncExternalBreachContent } from "./world/BreachContentSync";
 import { syncExternalAccessProfiles } from "./world/SessionAccessSync";
 import { syncExternalServiceBinaries } from "./world/ServiceBinarySync";
 import { syncExternalReversePayloads } from "./world/ReversePayloads";
+import { registerReverseListenerApi } from "./world/ReverseListenerApi";
+import { registerReverseDeliverySignal } from "./world/ReverseCallback";
 
 const HANDBOOK_ENTRY_ID = "recon-ng-guide";
 const SSH_ENUM_ENTRY_ID = "recon-ng-ssh-user-enum";
@@ -101,8 +103,8 @@ run
 \`run\` prints the callback URL and begins listening. Place that exact URL into the
 message being sent to the target.
 
-A successful callback opens a new session. If it does not arrive immediately, the
-listener remains active in the background:
+A successful callback opens a new session. Keep the recon-ng terminal open while
+the listener waits, then use the returned session id:
 
 \`\`\`
 sessions
@@ -120,7 +122,8 @@ while \`sessions clear\` closes all of them.
 
 Inside a normal shell session, use \`ls\`, \`cd\`, \`pwd\`, \`whoami\`,
 \`su [user]\`, \`sudo <password>\`, \`cat <file>\`, \`download <file>\`,
-\`rm <file>\`, \`post [module]\`, \`background\`, and \`close\`.
+\`rm <file>\`, \`post [module]\`, \`linpeas\`, \`privesc\`, \`background\`,
+and \`close\`.
 
 Downloaded files are saved to \`~/downloads\`.
 
@@ -133,6 +136,7 @@ Downloaded files are saved to \`~/downloads\`.
 `.trim();
 
 const EXPLOIT_DEV_ENTRY_ID = "recon-ng-exploit-dev";
+const LOCAL_PRIVILEGE_ENTRY_ID = "recon-ng-local-privilege";
 
 const SSH_ENUM_CONTENT = `
 # SSH Username Enumeration
@@ -273,6 +277,73 @@ run
 \`\`\`
 `.trim();
 
+const LOCAL_PRIVILEGE_CONTENT = `
+# Local Privilege Escalation
+
+Some exploited targets may allow local privilege escalation by abusing a buffer overflow or command lookup in certain functions.
+To get a list of local functions that run as root, use the linpeas command and then inspect each function with linpeas inspect:
+
+\`\`\`
+linpeas
+linpeas inspect <function>
+\`\`\`
+
+Use \`privesc build\` to prepare a local exploit, then \`privesc run\` to run it and elevate your session.
+
+## Abusing local vulnerabilities
+
+You can identify a vulnerable function by its input and guard. A command lookup is vulnerable if the input comes from the session environment and the system path is not fixed before command lookup.
+A buffer overflow can be abused if the function copies a label argument into a fixed buffer and the buffer length is only checked after copying.
+
+To abuse a function with a local command lookup vulnerability:
+
+\`\`\`
+linpeas inspect <function>
+privesc build <function> <command that is being invoked>
+privesc run
+\`\`\`
+
+For example:
+
+\`\`\`
+> linpeas inspect snapshot-run
+process: /usr/local/sbin/snapshot-run
+effective user: root
+input: session environment
+action: invokes cpio by name for an archive job
+guard: no fixed system path before command lookup
+
+> privesc build snapshot-run cpio
+> privesc run
+\`\`\`
+
+To abuse a function with a buffer overflow vulnerability:
+
+\`\`\`
+linpeas inspect <function>
+privesc build <function> <buffer length + saved frame>
+privesc run
+\`\`\`
+
+For example:
+
+\`\`\`
+> linpeas inspect archive-sync-check
+process: /usr/local/sbin/archive-sync-check
+effective user: root
+input: label argument
+action: copies label into a 80-byte buffer; saved frame is 8 bytes
+guard: length checked after copy
+
+> privesc build archive-sync-check 88
+local input prepared for archive-sync-check
+
+> privesc run
+\`\`\`
+`.trim();
+
+
+
 @RegisterModPackage
 export default class ReconNg extends Bootstrap {
     Settings = [
@@ -289,6 +360,8 @@ export default class ReconNg extends Bootstrap {
         initDemoContent();
         registerHawkEyeAppBridge();
         registerHostFileBridge();
+        registerReverseListenerApi();
+        registerReverseDeliverySignal();
         registerBuiltInAccessProfiles();
         syncExternalBreachContent();
         syncExternalAccessProfiles();
@@ -328,12 +401,19 @@ export default class ReconNg extends Bootstrap {
             content: EXPLOIT_DEV_CONTENT,
             order: 2,
         });
+        Handbook.registerEntry({
+            id: LOCAL_PRIVILEGE_ENTRY_ID,
+            category: "recon-ng",
+            title: "Local Privilege Escalation",
+            content: LOCAL_PRIVILEGE_CONTENT,
+            order: 3,
+        });
     }
 
     OnModPackageUnloaded() {
         // Unload runs without a mod context, so these permission gated calls can throw. Guarding
         // each one keeps a failure from stranding the entries that come after it.
-        for (const id of [HANDBOOK_ENTRY_ID, SSH_ENUM_ENTRY_ID, EXPLOIT_DEV_ENTRY_ID]) {
+        for (const id of [HANDBOOK_ENTRY_ID, SSH_ENUM_ENTRY_ID, EXPLOIT_DEV_ENTRY_ID, LOCAL_PRIVILEGE_ENTRY_ID]) {
             try {
                 Handbook.unregisterEntry(id);
             } catch { }
