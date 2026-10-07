@@ -43,10 +43,14 @@ export function buildLocalPrivilegeProfile(target: LocalPrivilegeTarget, ip: str
                 { id: "ledger-export", command: "powershell.exe", work: "an export job" },
                 { id: "snapshot-check", command: "certutil.exe", work: "an integrity check" },
                 { id: "mirror-sync", command: "xcopy.exe", work: "a mirror job" },
+                { id: "log-archive", command: "makecab.exe", work: "a log rotation job" },
+                { id: "queue-flush", command: "bitsadmin.exe", work: "a transfer job" },
+                { id: "cert-renew", command: "certreq.exe", work: "a certificate renewal job" },
+                { id: "index-compact", command: "esentutl.exe", work: "a database maintenance job" },
             ] as const;
             const index = (chosen >>> 12) % jobs.length;
             const vulnerable = jobs[index];
-            const guarded = jobs[(index + 1) % jobs.length];
+            const guarded = jobs[(index + 1 + ((chosen >>> 5) % (jobs.length - 1))) % jobs.length];
             const routine = (job: typeof vulnerable, unsafe: boolean): LocalPrivilegeRoutine => ({
                 id: job.id,
                 process: `C:\\Program Files\\VaultOps\\${job.id}.exe`,
@@ -60,10 +64,10 @@ export function buildLocalPrivilegeProfile(target: LocalPrivilegeTarget, ip: str
                 solution: { routineId: vulnerable.id, value: vulnerable.command },
             };
         }
-        const jobs = ["vault-index-check", "archive-verify", "queue-decode", "record-parse"];
+        const jobs = ["vault-index-check", "archive-verify", "queue-decode", "record-parse", "ledger-audit", "catalog-rebuild"];
         const index = (chosen >>> 12) % jobs.length;
-        const buffer = [32, 48, 64, 80][(chosen >>> 5) % 4];
-        const frame = [8, 16][(chosen >>> 9) % 2];
+        const buffer = [32, 48, 64, 80, 96][(chosen >>> 5) % 5];
+        const frame = [8, 16, 24][(chosen >>> 9) % 3];
         const routine = (id: string, unsafe: boolean): LocalPrivilegeRoutine => ({
             id,
             process: `C:\\Program Files\\VaultOps\\${id}.exe`,
@@ -72,7 +76,7 @@ export function buildLocalPrivilegeProfile(target: LocalPrivilegeTarget, ip: str
             guard: unsafe ? "length checked after copy" : "length checked before copy",
         });
         const vulnerable = jobs[index];
-        const guarded = jobs[(index + 1) % jobs.length];
+        const guarded = jobs[(index + 1 + ((chosen >>> 5) % (jobs.length - 1))) % jobs.length];
         return {
             os, family,
             routines: chosen & 2 ? [routine(guarded, false), routine(vulnerable, true)] : [routine(vulnerable, true), routine(guarded, false)],
