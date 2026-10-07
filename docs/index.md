@@ -10,6 +10,7 @@
 - [Modules](modules.md)
 - [Authoring an Exploit](authoring-exploits.md)
 - [Exploit Development](exploit-development.md)
+- [Local Privilege Escalation](local-privilege.md)
 - [Standing Up a Target](targets.md)
 - [Events](events.md)
 - [Quest Loot Overlays](loot-overlays.md)
