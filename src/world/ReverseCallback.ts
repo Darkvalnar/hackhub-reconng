@@ -1,5 +1,6 @@
-import { SharedStorage, UI } from "@hotbunny/hackhub-content-sdk";
+import { Events, SharedStorage } from "@hotbunny/hackhub-content-sdk";
 import { BreachBackend } from "./BreachBackend";
+import { completeReverseListener, REVERSE_DELIVERY_AVAILABLE_EVENT } from "./ReverseListenerApi";
 import {
     checkReverseListenerNetwork,
     clearArmedReverseListener,
@@ -7,17 +8,19 @@ import {
     getArmedReverseListener,
     getReverseTarget,
     reverseCallbackUrl,
+    type ArmedReverseListener,
 } from "./ReversePayloads";
 
-const SET_DELIVERIES_KEY = "reconng.reverse.deliveries";
-const SET_BURNED_LURES_KEY = "reconng.reverse.burnedlures";
+const REVERSE_DELIVERIES_KEY = "reconng.reverse.deliveries";
+const REVERSE_BURNED_LURES_KEY = "reconng.reverse.burnedlures";
+let deliverySignalRegistered = false;
 
 function burnLure(email: string, lureId?: string): void {
     const id = String(lureId ?? "").trim().toLowerCase();
     const target = String(email ?? "").trim().toLowerCase();
     if (!id || !target) return;
     try {
-        const raw = SharedStorage.get<any[]>(SET_BURNED_LURES_KEY);
+        const raw = SharedStorage.get<any[]>(REVERSE_BURNED_LURES_KEY);
         const list = Array.isArray(raw) ? raw : [];
         const exists = list.some(
             (entry) =>
@@ -26,23 +29,29 @@ function burnLure(email: string, lureId?: string): void {
         );
         if (exists) return;
         list.push({ email: target, lureId: id, t: Date.now() });
-        SharedStorage.set(SET_BURNED_LURES_KEY, list);
+        SharedStorage.set(REVERSE_BURNED_LURES_KEY, list);
     } catch {
         // Burn tracking is best-effort; never block the callback path.
     }
 }
 
 export function clearReverseDeliveries(): void {
-    SharedStorage.set(SET_DELIVERIES_KEY, []);
+    SharedStorage.set(REVERSE_DELIVERIES_KEY, []);
 }
 
 // Provider mods write completed deliveries to SharedStorage. Recon-NG drains them
-// on console launch and while a listener is armed.
-export function consumeReverseDeliveries(): void {
-    const raw = SharedStorage.get<any[]>(SET_DELIVERIES_KEY);
-    if (!Array.isArray(raw) || raw.length === 0) return;
+// on console launch, from an interactive listener, or after the documented signal.
+export type ReverseCallbackResult =
+    | { status: "ignored" }
+    | { status: "opened"; sessionId: string; sessionHost: string }
+    | { status: "failed"; reason: string };
+
+export function consumeReverseDeliveries(): ReverseCallbackResult[] {
+    const raw = SharedStorage.get<any[]>(REVERSE_DELIVERIES_KEY);
+    if (!Array.isArray(raw) || raw.length === 0) return [];
+    const results: ReverseCallbackResult[] = [];
     for (const delivery of raw) {
-        attemptReverseCallback({
+        results.push(attemptReverseCallback({
             email: String(delivery?.email ?? ""),
             role: String(delivery?.role ?? ""),
             id: delivery?.id != null ? String(delivery.id) : undefined,
@@ -53,9 +62,19 @@ export function consumeReverseDeliveries(): void {
             lureTags: Array.isArray(delivery?.lureTags) ? delivery.lureTags.map((tag: unknown) => String(tag)) : undefined,
             lureOutcome: delivery?.lureOutcome != null ? String(delivery.lureOutcome) as ReverseLureOutcome : undefined,
             messageBody: delivery?.messageBody != null ? String(delivery.messageBody) : undefined,
-        });
+        }));
     }
-    SharedStorage.set(SET_DELIVERIES_KEY, []);
+    SharedStorage.set(REVERSE_DELIVERIES_KEY, []);
+    return results;
+}
+
+export function registerReverseDeliverySignal(): void {
+    if (deliverySignalRegistered) return;
+    deliverySignalRegistered = true;
+    Events.on(REVERSE_DELIVERY_AVAILABLE_EVENT as any, () => {
+        if (!getArmedReverseListener()?.listenerId) return;
+        consumeReverseDeliveries();
+    });
 }
 
 /**
@@ -76,9 +95,9 @@ export interface ReverseDelivery {
     messageBody?: string;
 }
 
-export function attemptReverseCallback(delivery: ReverseDelivery): void {
+export function attemptReverseCallback(delivery: ReverseDelivery): ReverseCallbackResult {
     const armed = getArmedReverseListener();
-    if (!armed) return;
+    if (!armed) return { status: "ignored" };
 
     const email = delivery.email.trim().toLowerCase();
     const targetKey = armed.target.trim().toLowerCase();
@@ -88,49 +107,37 @@ export function attemptReverseCallback(delivery: ReverseDelivery): void {
         (targetKey === email ||
             targetKey === String(delivery.id ?? "").toLowerCase() ||
             targetKey === String(delivery.name ?? "").toLowerCase());
-    if (!matchesTarget) return;
+    if (!matchesTarget) return { status: "ignored" };
 
     const payload = findReversePayload(armed.payloadId);
-    if (!payload) return;
+    if (!payload) return fail(armed, "the selected payload is no longer installed.");
 
     const target = getReverseTarget(email);
     if (!target) {
-        UI.notify("Callback failed: no reachable host is tied to that target.");
-        clearArmedReverseListener();
-        return;
+        return fail(armed, "no reachable host is tied to that target.");
     }
 
     if (!affinityMatches(payload.affinities, delivery)) {
-        UI.notify(`Callback failed: that payload doesn't fit this target. No session.`);
-        clearArmedReverseListener();
-        return;
+        return fail(armed, "that payload does not fit the delivered pretext.");
     }
 
     const outcome = delivery.lureOutcome ?? "success";
     if (outcome === "not_interested") {
-        UI.notify("No callback. The target read it and moved on.");
-        clearArmedReverseListener();
-        return;
+        return fail(armed, "the target read the message and did not interact with the payload.");
     }
     if (outcome === "bounce") {
         burnLure(email, delivery.lureId);
-        UI.notify("No callback. That pretext put them on guard - it will not work on them again.");
-        clearArmedReverseListener();
-        return;
+        return fail(armed, "the pretext was rejected and is now burned for this target.");
     }
 
     const callbackUrl = reverseCallbackUrl(armed);
     if (!String(delivery.messageBody ?? "").includes(callbackUrl)) {
-        UI.notify("Callback failed: the delivered message did not contain this listener's callback URL.");
-        clearArmedReverseListener();
-        return;
+        return fail(armed, "the delivered message did not resolve to this listener's callback URL.");
     }
 
     const network = checkReverseListenerNetwork(armed);
     if (!network.ok) {
-        UI.notify(`Callback failed: ${network.reason ?? "the listener is no longer reachable."}`);
-        clearArmedReverseListener();
-        return;
+        return fail(armed, network.reason ?? "the listener is no longer reachable.");
     }
 
     const opened = BreachBackend.openReverseSession(target.ip, {
@@ -140,12 +147,18 @@ export function attemptReverseCallback(delivery: ReverseDelivery): void {
         desktop: target.desktop,
     });
     if (!opened.ok) {
-        UI.notify(`Callback failed: ${opened.reason}`);
-        return;
+        return fail(armed, opened.reason);
     }
 
+    completeReverseListener(armed, { state: "opened", sessionId: opened.session.id, sessionHost: opened.session.host });
     clearArmedReverseListener();
-    UI.notify(`Callback received - session ${opened.session.id} opened on ${opened.session.host}.`);
+    return { status: "opened", sessionId: opened.session.id, sessionHost: opened.session.host };
+}
+
+function fail(listener: ArmedReverseListener, reason: string): ReverseCallbackResult {
+    completeReverseListener(listener, { state: "failed", reason });
+    clearArmedReverseListener();
+    return { status: "failed", reason };
 }
 
 function affinityMatches(affinities: string[], delivery: ReverseDelivery): boolean {

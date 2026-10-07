@@ -66,7 +66,7 @@ function readableFiles(session: BreachSession): string[] {
     const filesystem = session.filesystem ?? {};
     return Object.keys(filesystem).filter((path) => {
         const node = filesystem[path];
-        return !!node && node.type === "file" && node.readable !== false;
+        return !!node && node.type === "file" && BreachBackend.readQuiet(session, path) !== null;
     });
 }
 

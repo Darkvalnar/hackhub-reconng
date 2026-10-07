@@ -5,12 +5,14 @@ export const REVERSE_PAYLOAD_SHARED_KEY = "reconng.reverse.payloads";
 export const REVERSE_PAYLOAD_PACKAGES_SHARED_KEY = "reconng.reverse.payload.packages";
 const REVERSE_PAYLOAD_STATE_KEY = "recon-ng.reversePayloads.owned";
 const ARMED_LISTENER_KEY = "recon-ng.reversePayloads.armed";
-
 export interface ArmedReverseListener {
     payloadId: string;
     lhost: string;
     lport: number;
     target: string;
+    listenerId?: string;
+    startedAt?: number;
+    expiresAt?: number;
 }
 
 export interface ReverseListenerNetworkCheck {

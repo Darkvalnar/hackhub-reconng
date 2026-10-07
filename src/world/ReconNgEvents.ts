@@ -23,8 +23,10 @@ export interface ReconNgEventMap {
     };
     "ReconNg.Breach.DirListed":     { sessionId: string; ip: string; host: string; path: string };
     "ReconNg.Breach.FileRead":      { sessionId: string; ip: string; host: string; path: string; name: string };
-    "ReconNg.Breach.FileDownloaded":{ sessionId: string; ip: string; host: string; path: string; name: string; localPath: string };
+    "ReconNg.Breach.FileDownloaded":{ sessionId: string; ip: string; host: string; path: string; name: string; localPath: string; localFileId: string };
     "ReconNg.Breach.FileDeleted":   { sessionId: string; ip: string; host: string; path: string; name: string };
+    "ReconNg.Breach.PrivilegeEscalated": { sessionId: string; ip: string; host: string; technique: string };
+    "ReconNg.Breach.LocalActivity": { sessionId: string; ip: string; host: string; action: "scan" | "inspect" | "probe" | "build" | "run" };
     "ReconNg.Breach.Shutdown":      { sessionId: string; ip: string; host: string };
     "ReconNg.Breach.SessionClosed": { sessionId: string; ip: string; host: string; reason: string };
     "ReconNg.UserEnum.Complete":    { ip: string; host: string; moduleId: string; users: string[] };

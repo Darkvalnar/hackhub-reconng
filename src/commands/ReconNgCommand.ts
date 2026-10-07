@@ -37,7 +37,7 @@ import {
     syncExternalReversePayloads,
     type ReversePayloadDefinition,
 } from "../world/ReversePayloads";
-import { clearReverseDeliveries, consumeReverseDeliveries } from "../world/ReverseCallback";
+import { clearReverseDeliveries, consumeReverseDeliveries, type ReverseCallbackResult } from "../world/ReverseCallback";
 import { consumeSessionTermination } from "../world/SessionControl";
 
 const PROMPT = "rng6";
@@ -95,11 +95,12 @@ async function runReconNg(tools: CommandTools, commandName: string): Promise<voi
         syncExternalBreachContent();
         syncExternalAccessProfiles();
         syncExternalReversePayloads();
-        consumeReverseDeliveries();
+        const startupCallbacks = consumeReverseDeliveries();
         registerExploitShop();
         registerLabWordlists();
         const state: ConsoleState = { rhost: "" };
         printSplash(tools, commandName);
+        for (const result of startupCallbacks) printReverseCallbackResult(tools, result);
 
         while (true) {
             const line = (await tools.prompt({ label: promptLabel(state), color: PROMPT_COLOR })).trim();
@@ -412,7 +413,13 @@ async function armReversePayload(tools: CommandTools, state: ConsoleState): Prom
     const maxTicks = Math.ceil(REVERSE_LISTENER_TIMEOUT_MS / REVERSE_LISTENER_INTERVAL_MS);
     for (let i = 0; i < maxTicks; i += 1) {
         await tools.sleep(REVERSE_LISTENER_INTERVAL_MS);
-        consumeReverseDeliveries();
+        const callbackResults = consumeReverseDeliveries();
+        const callback = callbackResults.find((result) => result.status !== "ignored");
+        if (callback) {
+            printReverseCallbackResult(tools, callback);
+            state.payload = undefined;
+            return;
+        }
         const fresh = BreachBackend.listSessions().find((session) => !before.has(session.id) && (!expected || session.ip === expected.ip));
         if (fresh) {
             tools.println([{ text: "[+] ", color: "green", bold: true }, { text: `session ${fresh.id} opened`, color: "white", bold: true }, { text: ` (${fresh.user}@${fresh.host})`, color: "gray" }]);
@@ -718,6 +725,7 @@ function craftModule(lab: LabState, functions: BinaryFunction[], vuln: VulnType)
         description: `Crafted from ${sourceNames} via exploit development against ${lab.service} ${lab.version}.`,
         access: lab.access,
         desktop: lab.desktop,
+        crafted: true,
     };
 }
 
@@ -1032,7 +1040,7 @@ function activateSession(tools: CommandTools, state: ConsoleState, id: string): 
     }
 
     state.activeSessionId = session.id;
-    tools.println([{ text: "[*] ", color: "cyan" }, { text: `interacting with session ${session.id}. type 'background' to return.`, color: "gray" }]);
+    tools.println([{ text: "[*] ", color: "cyan" }, { text: `interacting with session ${session.id}. type 'help' for session commands or 'background' to return.`, color: "gray" }]);
 }
 
 async function runSessionCommand(tools: CommandTools, state: ConsoleState, line: string): Promise<boolean> {
@@ -1129,10 +1137,52 @@ async function runSessionCommand(tools: CommandTools, state: ConsoleState, line:
             return false;
         }
         const file = BreachBackend.read(session, path);
-        if (!file) tools.printError("cat: unable to read file");
+        if (!file) tools.printError(`cat: ${BreachBackend.readFailure(session, path)}`);
         else {
             tools.println([{ text: `--- ${file.path} `, color: "gray" }, { text: "-----------", color: "gray" }]);
             printFileContent(tools, file.data);
+        }
+        return false;
+    }
+    if (command === "linpeas") {
+        const [action, routineId, value] = args;
+        if (!action) {
+            ReconNgEvents.emit("ReconNg.Breach.LocalActivity", { sessionId: session.id, ip: session.ip, host: session.host, action: "scan" });
+            const result = BreachBackend.scanLocalPrivilege(session.id);
+            if (!result.ok) tools.printError(`linpeas: ${result.reason}`);
+            else for (const observation of result.observations) tools.println(observation);
+        } else if (action === "inspect" && routineId && !value) {
+            ReconNgEvents.emit("ReconNg.Breach.LocalActivity", { sessionId: session.id, ip: session.ip, host: session.host, action: "inspect" });
+            const result = BreachBackend.inspectLocalPrivilege(session.id, routineId);
+            if (!result.ok) tools.printError(`linpeas: ${result.reason}`);
+            else for (const line of result.lines) tools.println(line);
+        } else if (action === "probe" && routineId && value) {
+            ReconNgEvents.emit("ReconNg.Breach.LocalActivity", { sessionId: session.id, ip: session.ip, host: session.host, action: "probe" });
+            const result = BreachBackend.probeLocalPrivilege(session.id, routineId, value);
+            if (!result.ok) tools.printError(`linpeas: ${result.reason}`);
+            else tools.println(`probe: ${result.observation}`);
+        } else {
+            tools.println("linpeas");
+            tools.println("linpeas inspect <routine>");
+            tools.println("linpeas probe <routine> <input>");
+        }
+        return false;
+    }
+    if (command === "privesc") {
+        const [action, ...parameters] = args;
+        if (action === "build" && parameters.length === 2) {
+            ReconNgEvents.emit("ReconNg.Breach.LocalActivity", { sessionId: session.id, ip: session.ip, host: session.host, action: "build" });
+            const result = BreachBackend.prepareLocalPrivilege(session.id, parameters[0], parameters[1]);
+            if (!result.ok) tools.printError(`privesc: ${result.reason}`);
+            else tools.printSuccess(`local input prepared for ${parameters[0]}`);
+        } else if (action === "run" && parameters.length === 0) {
+            ReconNgEvents.emit("ReconNg.Breach.LocalActivity", { sessionId: session.id, ip: session.ip, host: session.host, action: "run" });
+            const result = BreachBackend.runLocalPrivilege(session.id);
+            if (!result.ok) tools.printError(`privesc: ${result.reason}`);
+            else tools.printSuccess("local escalation succeeded; session is root");
+        } else {
+            tools.println("privesc build <routine> <input>");
+            tools.println("privesc run");
         }
         return false;
     }
@@ -1218,10 +1268,11 @@ async function downloadFile(tools: CommandTools, session: BreachSession, path?: 
     }
     const fullName = safeDownloadName(session, file.path);
     const existing = await Files.getByPath(`~/downloads/${fullName}`);
-    if (existing) Files.write(existing.id, file.data);
+    let localFile = existing;
+    if (localFile) Files.write(localFile.id, file.data);
     else {
         const { name, extension } = splitFileName(fullName);
-        await Files.create({ name, extension, parentPath: "~/downloads", data: file.data });
+        localFile = await Files.create({ name, extension, parentPath: "~/downloads", data: file.data });
     }
     const localPath = `~/downloads/${fullName}`;
     ReconNgEvents.emit("ReconNg.Breach.FileDownloaded", {
@@ -1231,6 +1282,7 @@ async function downloadFile(tools: CommandTools, session: BreachSession, path?: 
         path: file.path,
         name: file.path.split("/").pop() ?? fullName,
         localPath,
+        localFileId: localFile.id,
     });
     BreachBackend.noteAccess(session, "get", file.path);
     tools.printSuccess(`saved ${localPath}`);
@@ -1280,63 +1332,84 @@ function printSplash(tools: CommandTools, commandName: string): void {
     tools.newLine();
 }
 
+function printHelpEntry(tools: CommandTools, usage: string, description: string, width: number): void {
+    tools.println([
+        { text: "  ", color: "gray" },
+        { text: usage.padEnd(width), color: "white", bold: true },
+        { text: " | ", color: "gray" },
+        { text: description, color: "gray" },
+    ]);
+}
+
+function printReverseCallbackResult(tools: CommandTools, result: ReverseCallbackResult): void {
+    if (result.status === "ignored") return;
+    if (result.status === "opened") {
+        tools.println([{ text: "[+] ", color: "green", bold: true }, { text: `session ${result.sessionId} opened`, color: "white", bold: true }, { text: ` (${result.sessionHost})`, color: "gray" }]);
+        tools.println([{ text: "    ", color: "gray" }, { text: `type 'sessions -i ${result.sessionId}' to enter.`, color: "gray" }]);
+        return;
+    }
+    tools.println([{ text: "[-] ", color: "red", bold: true }, { text: `callback failed: ${result.reason}`, color: "white" }]);
+}
+
 function printHelp(tools: CommandTools): void {
-    tools.println("Core commands");
-    tools.println("  set RHOST <ip-or-domain>      choose target");
-    tools.println("  set RPORT <port>              target port (defaults to the service's default port on use)");
-    tools.println("  set USER <username>           supply an account when a module needs one");
-    tools.println("  set WORDLIST <path>           supply a password list for brute modules");
-    tools.println("  search [service/module]       list exploit modules");
-    tools.println("  payloads                      list reverse callback payloads");
-    tools.println("  payloads import <file>        install a reverse payload package");
-    tools.println("  payloads info <payload>       show payload fit and delivery details");
-    tools.println("  use <module|index>            select module");
-    tools.println("  info [module]                 show module detail");
-    tools.println("  show options                  show selected target/module");
-    tools.println("  check                         verify target match");
-    tools.println("  run                           launch selected module");
-    tools.println("  sessions                      list sessions");
-    tools.println("  sessions close <id>           close a saved session");
-    tools.println("  sessions clear                 close all saved sessions");
-    tools.println("  interact <id>                 enter a session");
-    tools.println("  back                          unload module");
-    tools.println("  exit                          close recon-ng");
+    tools.println([{ text: "Core commands", color: "white", bold: true }]);
+    printHelpEntry(tools, "set RHOST <ip-or-domain>", "choose target", 30);
+    printHelpEntry(tools, "set RPORT <port>", "target port (defaults to the service's default port on use)", 30);
+    printHelpEntry(tools, "set USER <username>", "supply an account when a module needs one", 30);
+    printHelpEntry(tools, "set WORDLIST <path>", "supply a password list for brute modules", 30);
+    printHelpEntry(tools, "search [service/module]", "list exploit modules", 30);
+    printHelpEntry(tools, "payloads", "list reverse callback payloads", 30);
+    printHelpEntry(tools, "payloads import <file>", "install a reverse payload package", 30);
+    printHelpEntry(tools, "payloads info <payload>", "show payload fit and delivery details", 30);
+    printHelpEntry(tools, "use <module|index>", "select module", 30);
+    printHelpEntry(tools, "info [module]", "show module detail", 30);
+    printHelpEntry(tools, "show options", "show selected target/module", 30);
+    printHelpEntry(tools, "check", "verify target match", 30);
+    printHelpEntry(tools, "run", "launch selected module", 30);
+    printHelpEntry(tools, "sessions", "list sessions", 30);
+    printHelpEntry(tools, "sessions close <id>", "close a saved session", 30);
+    printHelpEntry(tools, "sessions clear", "close all saved sessions", 30);
+    printHelpEntry(tools, "interact <id>", "enter a session", 30);
+    printHelpEntry(tools, "back", "unload module", 30);
+    printHelpEntry(tools, "exit", "close recon-ng", 30);
     tools.newLine();
-    tools.println("Exploit development");
-    tools.println("  disasm [#|port|service]       pull and analyze the selected service binary");
-    tools.println("  inspect <function>            read what a function does with input");
-    tools.println("  build add <function>          add a function to the build chain");
-    tools.println("  build remove <function>       remove a function from the build chain");
-    tools.println("  build show                    show the current build chain");
-    tools.println("  build clear                   clear the current build chain");
-    tools.println("  build compile                 develop an exploit from the build chain");
+    tools.println([{ text: "Exploit development", color: "white", bold: true }]);
+    printHelpEntry(tools, "disasm [#|port|service]", "pull and analyze the selected service binary", 30);
+    printHelpEntry(tools, "inspect <function>", "read what a function does with input", 30);
+    printHelpEntry(tools, "build add <function>", "add a function to the build chain", 30);
+    printHelpEntry(tools, "build remove <function>", "remove a function from the build chain", 30);
+    printHelpEntry(tools, "build show", "show the current build chain", 30);
+    printHelpEntry(tools, "build clear", "clear the current build chain", 30);
+    printHelpEntry(tools, "build compile", "develop an exploit from the build chain", 30);
 }
 
 function printSessionHelp(tools: CommandTools, access?: string): void {
     const profile = access ? getAccessProfile(access) : undefined;
     if (profile) {
-        tools.println(`${profile.role} session`);
+        tools.println([{ text: `${profile.role} session`, color: "white", bold: true }]);
         for (const entry of profile.commands) {
             const usage = entry.kind === "read" ? `${entry.name} <id>` : entry.name;
-            tools.println(`  ${usage.padEnd(18)}${entry.description ?? ""}`);
+            printHelpEntry(tools, usage, entry.description ?? "", 18);
         }
-        tools.println("  background         return to recon-ng");
-        tools.println("  close             close this session");
+        printHelpEntry(tools, "background", "return to recon-ng", 18);
+        printHelpEntry(tools, "close", "close this session", 18);
         return;
     }
-    tools.println("Session commands");
-    tools.println("  ls [path]          list files");
-    tools.println("  cd <path>          change directory");
-    tools.println("  pwd                print current directory");
-    tools.println("  whoami             print session user");
-    tools.println("  su [user]          switch user with a cracked password");
-    tools.println("  sudo <password>    switch to root with a cracked password");
-    tools.println("  cat <file>         read file");
-    tools.println("  download <file>    save file to ~/downloads");
-    tools.println("  rm <file>          remove file when permitted");
-    tools.println("  post [module]      list or run post-exploitation modules");
-    tools.println("  background         return to recon-ng");
-    tools.println("  close              close this session");
+    tools.println([{ text: "Session commands", color: "white", bold: true }]);
+    printHelpEntry(tools, "ls [path]", "list files", 18);
+    printHelpEntry(tools, "cd <path>", "change directory", 18);
+    printHelpEntry(tools, "pwd", "print current directory", 18);
+    printHelpEntry(tools, "whoami", "print session user", 18);
+    printHelpEntry(tools, "su [user]", "switch user with a cracked password", 18);
+    printHelpEntry(tools, "sudo <password>", "switch to root with a cracked password", 18);
+    printHelpEntry(tools, "cat <file>", "read file", 18);
+    printHelpEntry(tools, "linpeas", "find and inspect privileged local routines", 18);
+    printHelpEntry(tools, "privesc", "prepare and run a local escalation", 18);
+    printHelpEntry(tools, "download <file>", "save file to ~/downloads", 18);
+    printHelpEntry(tools, "rm <file>", "remove file when permitted", 18);
+    printHelpEntry(tools, "post [module]", "list or run post-exploitation modules", 18);
+    printHelpEntry(tools, "background", "return to recon-ng", 18);
+    printHelpEntry(tools, "close", "close this session", 18);
 }
 
 function printModules(tools: CommandTools, modules: BreachModule[], label: string): void {

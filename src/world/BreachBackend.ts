@@ -2,6 +2,9 @@ import { Network, Random, SharedStorage, Shell, type SubnetInfo } from "@hotbunn
 import { GameStorage as Storage } from "./ReconNgStorage";
 import { ReconNgEvents } from "./ReconNgEvents";
 import { getActiveSessionLock, getClosedTargetGate } from "./SessionControl";
+import { getTargetModulePolicy, type TargetModulePolicy } from "./TargetModulePolicies";
+import { localPrivilegeProfile } from "./LocalPrivilegeTargets";
+import { md5Hex } from "../utils/md5";
 
 export type BreachPrivilege = "guest" | "user" | "www-data" | "root";
 export type DesktopOs = "linux" | "windows";
@@ -36,12 +39,14 @@ export interface BreachModule {
     price?: number;
     access?: string;
     desktop?: DesktopProfile;
+    crafted?: boolean;
 }
 
 export interface BreachFile {
     path: string;
     data: string;
     readable?: boolean;
+    readableBy?: string[];
     downloadable?: boolean;
     deletable?: boolean;
 }
@@ -82,6 +87,7 @@ export interface BreachNode {
     type: "dir" | "file";
     data?: string;
     readable?: boolean;
+    readableBy?: string[];
     downloadable?: boolean;
     deletable?: boolean;
 }
@@ -99,6 +105,7 @@ export interface BreachSession {
     access: string;
     desktop?: DesktopSession;
     filesystem: Record<string, BreachNode>;
+    localPrivilege?: { prepared?: { routineId: string; value: string } };
 }
 
 interface BreachState {
@@ -561,8 +568,21 @@ function buildUserEnumObservation(target: BreachResolvedTarget, record: UserEnum
     }
 }
 
-function moduleMatches(target: BreachResolvedTarget, module: BreachModule, rport?: number): boolean {
+function moduleAllowedByPolicy(module: BreachModule, policy?: TargetModulePolicy): boolean {
+    if (!policy) return true;
+    if (policy.requirement === "crafted" && module.crafted !== true && !module.id.toLowerCase().startsWith("exploit/crafted/")) {
+        return false;
+    }
+    if (module.service.toLowerCase() !== policy.service.toLowerCase()) return false;
+    if (!(module.versions ?? []).some((version) => version.toLowerCase() === policy.version.toLowerCase())) return false;
+    return (module.vulnerabilities ?? []).some((vulnerability) =>
+        vulnerability.toLowerCase() === policy.vulnerability.toLowerCase()
+    );
+}
+
+function moduleMatches(target: BreachResolvedTarget, module: BreachModule, rport?: number, policy?: TargetModulePolicy): boolean {
     if (module.access === "user-enum" && !findUserEnumTarget(target)) return false;
+    if (!moduleAllowedByPolicy(module, policy)) return false;
 
     const vulnOk = !module.vulnerabilities?.length ||
         module.vulnerabilities.some((vuln) => target.vulnerabilities.includes(vuln));
@@ -608,13 +628,32 @@ function postModulesOwned(state = getState()): BreachModule[] {
     return ownedModules(state).filter((module) => module.family === "post");
 }
 
+function normalizedReadableBy(users: string[] | undefined): string[] | undefined {
+    if (users === undefined) return undefined;
+    return [...new Set(users.map((user) => user.trim().toLowerCase()).filter(Boolean))];
+}
+
+function canReadNode(session: BreachSession, node: BreachNode): boolean {
+    if (node.readable === false) return false;
+    if (node.readableBy === undefined) return true;
+    const user = session.user.trim().toLowerCase();
+    if (user === "root" || session.privilege === "root") return true;
+    return node.readableBy.includes(user);
+}
+
+function sameStringArray(left: string[] | undefined, right: string[] | undefined): boolean {
+    if (left === undefined || right === undefined) return left === right;
+    return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
 function readSessionFile(session: BreachSession, path: string): BreachFile | null {
     const node = session.filesystem[normalizePath(path, session.cwd)];
-    if (!node || node.type !== "file" || node.readable === false) return null;
+    if (!node || node.type !== "file" || !canReadNode(session, node)) return null;
     return {
         path: normalizePath(path, session.cwd),
         data: node.data ?? "",
         readable: node.readable,
+        readableBy: node.readableBy,
         downloadable: node.downloadable,
         deletable: node.deletable,
     };
@@ -656,8 +695,9 @@ function passwdHashEntries(session: BreachSession): Array<{ user: string; hash: 
 }
 
 function passwordMatchesHash(hash: string, password: string): boolean {
-    const cracked = Shell.getCommandData("john", hash);
-    return String(cracked ?? "") === password;
+    if (/^[a-f0-9]{32}$/i.test(hash) && md5Hex(password) === hash.toLowerCase()) return true;
+    const fallback = Shell.getCommandData("john", hash);
+    return String(fallback ?? "") === password;
 }
 
 function validateModule(module: BreachModule): string | null {
@@ -701,6 +741,7 @@ function isBreachFile(value: unknown): value is BreachFile {
     return typeof file.path === "string"
         && typeof file.data === "string"
         && (file.readable === undefined || typeof file.readable === "boolean")
+        && (file.readableBy === undefined || (Array.isArray(file.readableBy) && file.readableBy.every((user) => typeof user === "string")))
         && (file.downloadable === undefined || typeof file.downloadable === "boolean")
         && (file.deletable === undefined || typeof file.deletable === "boolean");
 }
@@ -759,6 +800,7 @@ function addFile(fs: Record<string, BreachNode>, file: BreachFile): void {
         type: "file",
         data: file.data,
         readable: file.readable ?? true,
+        readableBy: normalizedReadableBy(file.readableBy),
         downloadable: file.downloadable ?? true,
         deletable: file.deletable ?? false,
     };
@@ -789,8 +831,19 @@ function accessLogLine(session: BreachSession, action: AccessLogAction, path: st
     return `${accessLogStamp()} sshd[${pid}]: subsystem sftp: ${action} "${path}" (user ${user})`;
 }
 
-function appendAccessLog(session: BreachSession, action: AccessLogAction, path: string): boolean {
-    const node = session.filesystem[ACCESS_LOG_PATH];
+function appendAccessLog(session: BreachSession, action: AccessLogAction, path: string): false | "created" | "appended" {
+    let node = session.filesystem[ACCESS_LOG_PATH];
+    let created = false;
+    if (!node) {
+        addDir(session.filesystem, "/var/log");
+        addFile(session.filesystem, {
+            path: ACCESS_LOG_PATH,
+            data: "",
+            deletable: true,
+        });
+        node = session.filesystem[ACCESS_LOG_PATH];
+        created = true;
+    }
     if (!node || node.type !== "file") return false;
 
     const lines = String(node.data ?? "").split("\n").filter((entry) => entry.length > 0);
@@ -802,7 +855,7 @@ function appendAccessLog(session: BreachSession, action: AccessLogAction, path: 
     } else {
         node.data = `${lines.join("\n")}\n`;
     }
-    return true;
+    return created ? "created" : "appended";
 }
 
 function defaultUserForPrivilege(privilege: BreachPrivilege): string {
@@ -934,16 +987,19 @@ function refreshExistingOverlayFiles(session: BreachSession, overlays: BreachFil
         const node = session.filesystem[normalizePath(overlay.path)];
         if (!node || node.type !== "file") continue;
         const readable = overlay.readable ?? true;
+        const readableBy = normalizedReadableBy(overlay.readableBy);
         const downloadable = overlay.downloadable ?? true;
         const deletable = overlay.deletable ?? false;
         if (
             node.data === overlay.data
             && node.readable === readable
+            && sameStringArray(node.readableBy, readableBy)
             && node.downloadable === downloadable
             && node.deletable === deletable
         ) continue;
         node.data = overlay.data;
         node.readable = readable;
+        node.readableBy = readableBy;
         node.downloadable = downloadable;
         node.deletable = deletable;
         changed = true;
@@ -966,6 +1022,18 @@ function markPathDeleted(state: BreachState, target: { ip?: string; host?: strin
         if (!key) continue;
         const existing = state.deletedPaths[key] ?? [];
         if (!existing.includes(full)) state.deletedPaths[key] = [...existing, full];
+    }
+}
+
+function restoreDeletedPath(state: BreachState, target: { ip?: string; host?: string }, path: string): void {
+    if (!state.deletedPaths) return;
+    const full = normalizePath(path);
+    for (const key of targetKeys(target)) {
+        const existing = state.deletedPaths[key];
+        if (!existing) continue;
+        const next = existing.filter((candidate) => normalizePath(candidate) !== full);
+        if (next.length) state.deletedPaths[key] = next;
+        else delete state.deletedPaths[key];
     }
 }
 
@@ -1526,7 +1594,8 @@ export const BreachBackend = {
         const target = this.resolveTarget(input);
         if (!target) return [];
         if (getClosedTargetGate(target.ip, target.host)) return [];
-        return exploitModules().filter((module) => moduleMatches(target, module, options?.rport));
+        const policy = getTargetModulePolicy(target.ip, target.host);
+        return exploitModules().filter((module) => moduleMatches(target, module, options?.rport, policy));
     },
 
     searchModules(query: string): BreachModule[] {
@@ -1565,7 +1634,8 @@ export const BreachBackend = {
         if (module.requiresUser && !options?.user) return { ok: false, reason: "USER is required for this module", target, module };
         if (module.requiresWordlist && !options?.wordlist) return { ok: false, reason: "WORDLIST is required for this module", target, module };
         if (module.access === "user-enum" && !findUserEnumTarget(target)) return { ok: false, reason: "target does not expose an enumerable SSH account surface", target, module };
-        if (!moduleMatches(target, module, options?.rport)) {
+        const policy = getTargetModulePolicy(target.ip, target.host);
+        if (!moduleMatches(target, module, options?.rport, policy)) {
             console.warn("[reconng-check] no match", JSON.stringify({
                 input,
                 resolvedIp: target.ip,
@@ -1755,6 +1825,83 @@ export const BreachBackend = {
         return { ok: true, session };
     },
 
+    scanLocalPrivilege(sessionId: string): { ok: true; observations: string[] } | { ok: false; reason: string } {
+        const session = this.getSession(sessionId);
+        if (!session) return { ok: false, reason: "session not found" };
+        const profile = localPrivilegeProfile(session.ip, session.host);
+        if (!profile) return { ok: false, reason: "no local escalation findings on this host" };
+        if (session.privilege === "root") return { ok: false, reason: "session is already root" };
+        return { ok: true, observations: profile.routines.map((routine, index) => `${index + 1}. ${routine.id}  (${routine.process})`) };
+    },
+
+    inspectLocalPrivilege(sessionId: string, routineId: string): { ok: true; lines: string[] } | { ok: false; reason: string } {
+        const session = this.getSession(sessionId);
+        if (!session) return { ok: false, reason: "session not found" };
+        const profile = localPrivilegeProfile(session.ip, session.host);
+        if (!profile) return { ok: false, reason: "no local escalation findings on this host" };
+        const routine = profile.routines.find((item) => item.id === routineId);
+        if (!routine) return { ok: false, reason: "routine not found" };
+        return { ok: true, lines: [
+            `process: ${routine.process}`,
+            "effective user: root",
+            `input: ${routine.input}`,
+            `action: ${routine.action}`,
+            `guard: ${routine.guard}`,
+        ] };
+    },
+
+    probeLocalPrivilege(sessionId: string, routineId: string, value: string): { ok: true; observation: string } | { ok: false; reason: string } {
+        const session = this.getSession(sessionId);
+        if (!session) return { ok: false, reason: "session not found" };
+        const profile = localPrivilegeProfile(session.ip, session.host);
+        if (!profile) return { ok: false, reason: "no local escalation findings on this host" };
+        const routine = profile.routines.find((item) => item.id === routineId);
+        if (!routine) return { ok: false, reason: "routine not found" };
+        if (routine.id !== profile.solution.routineId) {
+            return { ok: true, observation: profile.family === "search-path"
+                ? "system command path takes precedence over session input"
+                : "label length is checked before the copy" };
+        }
+        const fits = value === profile.solution.value;
+        return { ok: true, observation: profile.family === "search-path"
+            ? fits ? `${value} reaches the root command lookup` : `${value} is not invoked by this routine`
+            : fits ? "label reaches the saved return slot" : "label does not reach the saved return slot" };
+    },
+
+    prepareLocalPrivilege(sessionId: string, routineId: string, value: string): { ok: true } | { ok: false; reason: string } {
+        const session = this.getSession(sessionId);
+        if (!session) return { ok: false, reason: "session not found" };
+        const profile = localPrivilegeProfile(session.ip, session.host);
+        if (!profile) return { ok: false, reason: "no local escalation findings on this host" };
+        if (session.privilege === "root") return { ok: false, reason: "session is already root" };
+        if (!profile.routines.some((item) => item.id === routineId)) return { ok: false, reason: "routine not found" };
+        session.localPrivilege ??= {};
+        session.localPrivilege.prepared = { routineId, value };
+        this.updateSession(session);
+        return { ok: true };
+    },
+
+    runLocalPrivilege(sessionId: string): { ok: true } | { ok: false; reason: string } {
+        const session = this.getSession(sessionId);
+        if (!session) return { ok: false, reason: "session not found" };
+        const profile = localPrivilegeProfile(session.ip, session.host);
+        if (!profile) return { ok: false, reason: "no local escalation findings on this host" };
+        const prepared = session.localPrivilege?.prepared;
+        if (!prepared) return { ok: false, reason: "no local input prepared" };
+        session.localPrivilege!.prepared = undefined;
+        if (prepared.routineId !== profile.solution.routineId || prepared.value !== profile.solution.value) {
+            this.updateSession(session);
+            return { ok: false, reason: "local escalation failed; session remains unprivileged" };
+        }
+        session.user = "root";
+        session.privilege = "root";
+        this.updateSession(session);
+        ReconNgEvents.emit("ReconNg.Breach.PrivilegeEscalated", {
+            sessionId: session.id, ip: session.ip, host: session.host, technique: profile.family,
+        });
+        return { ok: true };
+    },
+
     closeSession(id: string, reason = "closed"): boolean {
         const state = getState();
         const session = state.sessions.find((item) => item.id === id);
@@ -1816,12 +1963,27 @@ export const BreachBackend = {
     readQuiet(session: BreachSession, path: string): { path: string; data: string } | null {
         const fullPath = normalizePath(path, session.cwd);
         const node = session.filesystem[fullPath];
-        if (!node || node.type !== "file" || node.readable === false) return null;
+        if (!node || node.type !== "file" || !canReadNode(session, node)) return null;
         return { path: fullPath, data: node.data ?? "" };
     },
 
+    readFailure(session: BreachSession, path: string): string {
+        const node = session.filesystem[normalizePath(path, session.cwd)];
+        return node?.type === "file" && !canReadNode(session, node)
+            ? "permission denied"
+            : "unable to read file";
+    },
+
     noteAccess(session: BreachSession, action: AccessLogAction, path: string): void {
-        if (!appendAccessLog(session, action, path)) return;
+        const result = appendAccessLog(session, action, path);
+        if (!result) return;
+        if (result === "created") {
+            const state = getState();
+            restoreDeletedPath(state, { ip: session.ip, host: session.host }, ACCESS_LOG_PATH);
+            state.sessions = state.sessions.map((item) => item.id === session.id ? session : item);
+            setState(state);
+            return;
+        }
         this.updateSession(session);
     },
 
